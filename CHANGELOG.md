@@ -10,8 +10,13 @@ All notable changes to ESP-VISION are recorded here. The format follows [Keep a 
 - Added a hardware-in-the-loop CI stage that flashes the `ESP32_P4X_FUNCTION_EV_BOARD` build onto a real board and tests its camera and LCD, through `tools/ci/flash_and_test.py` and `tools/ci/device_checks.py`.
 - Added initial `ESP32_P4_WAVESHARE_DEV_KIT` support for the Waveshare ESP32-P4 Module Dev Kit: a free-running OV5647 MIPI-CSI camera on the shared SCCB bus (SDA 7, SCL 8; no reset, power-down, or XCLK wiring), hosted ESP32-C6 WiFi/BLE over 4-bit SDIO (CLK 18, CMD 19, D0-D3 14-17, reset 54), and 4-bit SDMMC storage on the on-chip LDO. The board has no LCD, so its default `main.py` flushes camera frames to the EV-MUX host preview instead.
 
+### Changed
+
+- Disabled EV-MUX console framing at boot on `ESP32_P4_WAVESHARE_DEV_KIT` (`ESP_VISION_EV_MUX_DEFAULT_ENABLED 0`), so the board presents a plain MicroPython REPL for Thonny, mpremote and WebREPL, and its default `main.py` no longer runs a preview loop (the board has no LCD and no EV-MUX sink to flush to). `sensor.evmux(True)` still enrolls the board into the ESP-VISION host tooling at runtime.
+
 ### Fixed
 
+- Fixed a board's `ESP_VISION_EV_MUX_DEFAULT_ENABLED` having no effect: `platform/ev_stdio.c` now includes `boardconfig.h`, which the option is documented to be set in.
 - Fixed Windows QSTR preprocessing with ESP-IDF 6.1 by evaluating CMake generator expressions in compiler response files, including Mbed TLS header paths, and omitting empty include and definition entries.
 - Fixed the hardware-in-the-loop device checks intermittently failing with `ValueError: not enough values to unpack` by parsing a device answer only once its whole line has arrived.
 - Fixed the Python CI jobs failing with `wget: command not found` by moving them from `python:3.11-slim` to `python:3.11`.

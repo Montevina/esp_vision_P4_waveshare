@@ -3,30 +3,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 MAIN_PY = """\
-import sensor
-import time
-
+# ESP-VISION ESP32_P4_WAVESHARE_DEV_KIT
+#
+# This board boots into the MicroPython REPL so Thonny, mpremote and WebREPL
+# work out of the box; there is no LCD and no EV-MUX console framing.
+# Put an application here to run it at startup, or keep this file as the
+# no-op default and develop interactively.
 print("ESP-VISION ESP32_P4_WAVESHARE_DEV_KIT ready")
-
-try:
-    sensor.reset()
-    sensor.set_pixformat(sensor.RGB565)
-    sensor.set_framesize(sensor.QVGA)
-    sensor.skip_frames(time=1000)
-
-    while True:
-        img = sensor.snapshot()
-        img.flush()
-        time.sleep_ms(20)
-finally:
-    sensor.shutdown()
 """
 
 README_TXT = """\
 ESP-VISION ESP32_P4_WAVESHARE_DEV_KIT
 
-Edit main.py to run your Python vision script.
-Use the ESP-VISION VSCode extension to run scripts and preview frames.
-The default main.py captures QVGA frames and flushes them to the host
-preview, because this board has no LCD.
+Connect Thonny (interpreter "MicroPython (ESP32)") or mpremote to the board's
+UART/USB-Serial-JTAG port and program it like any MicroPython board: the REPL
+and the filesystem are plain text, so files can be listed, uploaded and run
+directly. main.py runs at startup; boot.py is the place for WiFi setup.
+Camera, H.264 and RTSP come from the sensor, h264 and rtsp modules.
 """

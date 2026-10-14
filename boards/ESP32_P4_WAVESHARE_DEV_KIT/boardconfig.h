@@ -11,6 +11,11 @@
 #define ESP_VISION_BOARD_TYPE                  "ESP32_P4_WAVESHARE_DEV_KIT"
 #define ESP_VISION_PORT_ESP32                       (1)
 
+/* This board is meant for plain-REPL MicroPython tooling (Thonny, mpremote,
+ * WebREPL), so the console is not framed by EV-MUX at boot. The ESP-VISION
+ * host tooling can still be enrolled at runtime with sensor.evmux(True). */
+#define ESP_VISION_EV_MUX_DEFAULT_ENABLED           (0)
+
 #define ESP_VISION_IMLIB_PROFILER_ENABLE            (0)
 #define ESP_VISION_IMLIB_GPU_ENABLE                 (0)
 #define ESP_VISION_IMLIB_JPEG_CODEC_ENABLE          (0)
