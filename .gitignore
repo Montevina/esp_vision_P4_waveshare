@@ -64,3 +64,6 @@ logs/
 ae_upload_dl
 esp-dl
 esp-iot-solution
+
+# Board-local WiFi credentials used by the examples (never commit these).
+wifi.py
