@@ -1,0 +1,14 @@
+{
+    "deploy": [
+        "../deploy.md"
+    ],
+    "docs": "",
+    "features": [
+        "MIPI_CSI",
+        "OV5647",
+        "ESP32-C6 WiFi"
+    ],
+    "mcu": "esp32p4",
+    "product": "ESP32-P4-Waveshare-DEV-KIT",
+    "vendor": "Waveshare"
+}

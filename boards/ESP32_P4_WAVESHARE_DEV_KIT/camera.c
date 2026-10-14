@@ -1,0 +1,788 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "camera.h"
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL
+#include "camera_isp.h"
+#endif
+
+#include <fcntl.h>
+#include <inttypes.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include "driver/ppa.h"
+#include "esp_board_manager.h"
+#include "esp_board_manager_defs.h"
+#include "esp_board_manager_includes.h"
+#include "esp_cache.h"
+#include "esp_check.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_private/esp_cache_private.h"
+#include "linux/videodev2.h"
+#include "sys/mman.h"
+
+#include "boardconfig.h"
+
+#ifndef CMSIS_MCU_H
+#define CMSIS_MCU_H "cmsis_compiler.h"
+#endif
+
+#include "debug.h"
+
+#ifndef NO_QSTR
+#include "imlib.h"
+#endif
+
+#define ESP_VISION_CAMERA_MEMORY_TYPE V4L2_MEMORY_MMAP
+
+typedef struct {
+    void *ptr;
+    size_t len;
+} esp_vision_camera_buffer_t;
+
+typedef struct {
+    bool initialized;
+    bool video_initialized;
+    bool streaming;
+    bool hmirror;
+    bool vflip;
+    int fd;
+    uint32_t raw_input_width;
+    uint32_t raw_input_height;
+    uint32_t active_input_width;
+    uint32_t active_input_height;
+    uint32_t active_input_offset_x;
+    uint32_t active_input_offset_y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t input_pixfmt;
+    pixformat_t output_pixfmt;
+    size_t ppa_out_size;
+    ppa_client_handle_t ppa_handle;
+    uint8_t *ppa_out_buf;
+    const char *device_path;
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL
+    const char *isp_device_path;
+#endif
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL && CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER
+    const void *ipa_config;
+#endif
+    esp_vision_camera_buffer_t buffers[ESP_VISION_CAMERA_BUFFER_COUNT];
+} esp_vision_camera_context_t;
+
+static const char *TAG = "esp_vision_camera";
+static esp_vision_camera_context_t s_camera = {
+    .fd = -1,
+    .width = ESP_VISION_CAMERA_PPA_OUTPUT_QVGA_WIDTH,
+    .height = ESP_VISION_CAMERA_PPA_OUTPUT_QVGA_HEIGHT,
+    .output_pixfmt = PIXFORMAT_RGB565,
+};
+
+static void esp_vision_camera_set_defaults(void)
+{
+    s_camera.fd = -1;
+    s_camera.width = ESP_VISION_CAMERA_PPA_OUTPUT_QVGA_WIDTH;
+    s_camera.height = ESP_VISION_CAMERA_PPA_OUTPUT_QVGA_HEIGHT;
+    s_camera.output_pixfmt = PIXFORMAT_RGB565;
+}
+
+void esp_vision_camera_init0(void)
+{
+    esp_vision_camera_deinit();
+    memset(&s_camera, 0, sizeof(s_camera));
+    esp_vision_camera_set_defaults();
+}
+
+static size_t esp_vision_camera_align_up(size_t value, size_t alignment)
+{
+    if (alignment == 0) {
+        return value;
+    }
+    return ((value + alignment - 1) / alignment) * alignment;
+}
+
+static size_t esp_vision_camera_bpp(uint32_t pixfmt)
+{
+    switch (pixfmt) {
+    case PIXFORMAT_GRAYSCALE:
+        return sizeof(uint8_t);
+    case PIXFORMAT_RGB565:
+        return sizeof(uint16_t);
+    default:
+        return 0;
+    }
+}
+
+static size_t esp_vision_camera_output_size(uint32_t width, uint32_t height, uint32_t pixfmt)
+{
+    return (size_t)width * (size_t)height * esp_vision_camera_bpp(pixfmt);
+}
+
+static ppa_srm_color_mode_t esp_vision_camera_output_color_mode(uint32_t pixfmt)
+{
+    return (pixfmt == PIXFORMAT_GRAYSCALE) ? PPA_SRM_COLOR_MODE_GRAY8 : PPA_SRM_COLOR_MODE_RGB565;
+}
+
+esp_err_t esp_vision_camera_get_framesize_dimensions(esp_vision_camera_framesize_t framesize,
+                                                     uint32_t *width,
+                                                     uint32_t *height)
+{
+    if ((width == NULL) || (height == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    switch (framesize) {
+    case ESP_VISION_CAMERA_FRAMESIZE_QQVGA:
+        *width = ESP_VISION_CAMERA_PPA_OUTPUT_QQVGA_WIDTH;
+        *height = ESP_VISION_CAMERA_PPA_OUTPUT_QQVGA_HEIGHT;
+        return ESP_OK;
+    case ESP_VISION_CAMERA_FRAMESIZE_QVGA:
+        *width = ESP_VISION_CAMERA_PPA_OUTPUT_QVGA_WIDTH;
+        *height = ESP_VISION_CAMERA_PPA_OUTPUT_QVGA_HEIGHT;
+        return ESP_OK;
+    case ESP_VISION_CAMERA_FRAMESIZE_VGA:
+        *width = ESP_VISION_CAMERA_PPA_OUTPUT_VGA_WIDTH;
+        *height = ESP_VISION_CAMERA_PPA_OUTPUT_VGA_HEIGHT;
+        return ESP_OK;
+    default:
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
+static void esp_vision_camera_release_buffers(void)
+{
+    for (size_t i = 0; i < ESP_VISION_CAMERA_BUFFER_COUNT; i++) {
+        if (s_camera.buffers[i].ptr != NULL) {
+            munmap(s_camera.buffers[i].ptr, s_camera.buffers[i].len);
+            s_camera.buffers[i].ptr = NULL;
+            s_camera.buffers[i].len = 0;
+        }
+    }
+}
+
+static void esp_vision_camera_release_ppa(void)
+{
+    if (s_camera.ppa_handle != NULL) {
+        ppa_unregister_client(s_camera.ppa_handle);
+        s_camera.ppa_handle = NULL;
+    }
+    if (s_camera.ppa_out_buf != NULL) {
+        heap_caps_free(s_camera.ppa_out_buf);
+        s_camera.ppa_out_buf = NULL;
+    }
+    s_camera.ppa_out_size = 0;
+}
+
+static esp_err_t esp_vision_camera_video_init(void)
+{
+    esp_err_t ret = esp_board_manager_init_device_by_name(ESP_BOARD_DEVICE_NAME_CAMERA);
+    ESP_RETURN_ON_ERROR(ret, TAG, "board manager failed to initialize camera");
+
+    dev_camera_handle_t *camera = NULL;
+    ret = esp_board_manager_get_device_handle(ESP_BOARD_DEVICE_NAME_CAMERA,
+                                              (void **)&camera);
+    if ((ret != ESP_OK) || (camera == NULL) || (camera->dev_path == NULL)) {
+        (void)esp_board_manager_deinit_device_by_name(ESP_BOARD_DEVICE_NAME_CAMERA);
+        return (ret == ESP_OK) ? ESP_ERR_INVALID_STATE : ret;
+    }
+
+    s_camera.device_path = camera->dev_path;
+    s_camera.video_initialized = true;
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL
+    s_camera.isp_device_path = camera->meta_path;
+#endif
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL && CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER
+    s_camera.ipa_config = NULL;
+    ret = esp_vision_video_isp_lookup_ipa(camera->dev_path, camera->meta_path, &s_camera.ipa_config);
+    ESP_RETURN_ON_ERROR(ret, TAG, "failed to get camera IPA configuration");
+#endif
+    return ESP_OK;
+}
+
+static void esp_vision_camera_video_deinit(void)
+{
+    if (s_camera.video_initialized) {
+        esp_err_t ret = esp_board_manager_deinit_device_by_name(ESP_BOARD_DEVICE_NAME_CAMERA);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "failed to deinitialize camera: %s", esp_err_to_name(ret));
+        }
+        // A failed deinit may leave the ISP pointing at the LSC tables, so only
+        // free them once the device is known to be gone.
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL
+        esp_vision_video_isp_release(ret == ESP_OK);
+#endif
+        s_camera.device_path = NULL;
+        s_camera.video_initialized = false;
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL
+        s_camera.isp_device_path = NULL;
+#endif
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL && CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER
+        s_camera.ipa_config = NULL;
+#endif
+    }
+}
+
+static esp_err_t esp_vision_camera_open_device(void)
+{
+    struct v4l2_capability capability = {0};
+
+    if (s_camera.device_path == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_camera.fd = open(s_camera.device_path, O_RDWR);
+    if (s_camera.fd < 0) {
+        ESP_LOGE(TAG, "failed to open %s", s_camera.device_path);
+        return ESP_FAIL;
+    }
+
+    if (ioctl(s_camera.fd, VIDIOC_QUERYCAP, &capability) != 0) {
+        ESP_LOGE(TAG, "failed to query camera capability");
+        close(s_camera.fd);
+        s_camera.fd = -1;
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t esp_vision_camera_set_input_format(void)
+{
+    struct v4l2_format format = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .fmt.pix.width = ESP_VISION_CAMERA_RAW_INPUT_WIDTH,
+        .fmt.pix.height = ESP_VISION_CAMERA_RAW_INPUT_HEIGHT,
+        .fmt.pix.pixelformat = V4L2_PIX_FMT_RGB565,
+    };
+
+    if (ioctl(s_camera.fd, VIDIOC_S_FMT, &format) != 0) {
+        ESP_LOGE(TAG, "failed to set camera input format");
+        return ESP_FAIL;
+    }
+
+    if (format.fmt.pix.pixelformat != V4L2_PIX_FMT_RGB565) {
+        ESP_LOGE(TAG, "camera selected unsupported input format");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    s_camera.raw_input_width = format.fmt.pix.width;
+    s_camera.raw_input_height = format.fmt.pix.height;
+    s_camera.input_pixfmt = format.fmt.pix.pixelformat;
+    return ESP_OK;
+}
+
+static void esp_vision_camera_update_active_window(void)
+{
+    s_camera.active_input_width = ESP_VISION_CAMERA_ACTIVE_INPUT_WIDTH;
+    s_camera.active_input_height = ESP_VISION_CAMERA_ACTIVE_INPUT_HEIGHT;
+
+    if ((s_camera.active_input_width == 0) || (s_camera.active_input_width > s_camera.raw_input_width)) {
+        s_camera.active_input_width = s_camera.raw_input_width;
+    }
+    if ((s_camera.active_input_height == 0) || (s_camera.active_input_height > s_camera.raw_input_height)) {
+        s_camera.active_input_height = s_camera.raw_input_height;
+    }
+
+    s_camera.active_input_offset_x = (s_camera.raw_input_width - s_camera.active_input_width) / 2;
+    s_camera.active_input_offset_y = (s_camera.raw_input_height - s_camera.active_input_height) / 2;
+}
+
+static esp_err_t esp_vision_camera_init_ppa(void)
+{
+    esp_err_t ret;
+    size_t cache_align = 0;
+    size_t out_size;
+    ppa_client_config_t ppa_config = {
+        .oper_type = PPA_OPERATION_SRM,
+    };
+
+    ESP_RETURN_ON_ERROR(esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, &cache_align),
+                        TAG,
+                        "failed to get DMA cache alignment");
+    if (cache_align == 0) {
+        cache_align = ESP_VISION_DMA_ALIGNMENT;
+    }
+
+    out_size = esp_vision_camera_output_size(s_camera.width, s_camera.height, s_camera.output_pixfmt);
+    if (out_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ret = ppa_register_client(&ppa_config, &s_camera.ppa_handle);
+    ESP_RETURN_ON_ERROR(ret, TAG, "failed to register PPA client");
+
+    s_camera.ppa_out_size = esp_vision_camera_align_up(out_size, cache_align);
+    s_camera.ppa_out_buf = heap_caps_aligned_calloc(cache_align,
+                                                    1,
+                                                    s_camera.ppa_out_size,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (s_camera.ppa_out_buf == NULL) {
+        s_camera.ppa_out_buf = heap_caps_aligned_calloc(cache_align,
+                                                        1,
+                                                        s_camera.ppa_out_size,
+                                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    }
+    if (s_camera.ppa_out_buf == NULL) {
+        esp_vision_camera_release_ppa();
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_vision_camera_update_active_window();
+    return ESP_OK;
+}
+
+static esp_err_t esp_vision_camera_reinit_ppa(void)
+{
+    esp_vision_camera_release_ppa();
+    return esp_vision_camera_init_ppa();
+}
+
+static esp_err_t esp_vision_camera_init_buffers(void)
+{
+    struct v4l2_requestbuffers req = {
+        .count = ESP_VISION_CAMERA_BUFFER_COUNT,
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+        .memory = ESP_VISION_CAMERA_MEMORY_TYPE,
+    };
+
+    if (ioctl(s_camera.fd, VIDIOC_REQBUFS, &req) != 0) {
+        ESP_LOGE(TAG, "failed to request camera buffers");
+        return ESP_FAIL;
+    }
+
+    if (req.count < ESP_VISION_CAMERA_BUFFER_COUNT) {
+        ESP_LOGE(TAG, "camera returned insufficient buffers");
+        return ESP_ERR_NO_MEM;
+    }
+
+    for (uint32_t i = 0; i < ESP_VISION_CAMERA_BUFFER_COUNT; i++) {
+        struct v4l2_buffer buf = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = ESP_VISION_CAMERA_MEMORY_TYPE,
+            .index = i,
+        };
+
+        if (ioctl(s_camera.fd, VIDIOC_QUERYBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "failed to query camera buffer %" PRIu32, i);
+            return ESP_FAIL;
+        }
+
+        s_camera.buffers[i].ptr = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+                                       s_camera.fd, buf.m.offset);
+        s_camera.buffers[i].len = buf.length;
+        if ((s_camera.buffers[i].ptr == NULL) || (s_camera.buffers[i].ptr == MAP_FAILED)) {
+            s_camera.buffers[i].ptr = NULL;
+            s_camera.buffers[i].len = 0;
+            ESP_LOGE(TAG, "failed to map camera buffer %" PRIu32, i);
+            return ESP_FAIL;
+        }
+
+        if (ioctl(s_camera.fd, VIDIOC_QBUF, &buf) != 0) {
+            ESP_LOGE(TAG, "failed to queue camera buffer %" PRIu32, i);
+            return ESP_FAIL;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t esp_vision_camera_start_stream(void)
+{
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+    if (ioctl(s_camera.fd, VIDIOC_STREAMON, &type) != 0) {
+        ESP_LOGE(TAG, "failed to start camera stream");
+        return ESP_FAIL;
+    }
+
+    s_camera.streaming = true;
+    return ESP_OK;
+}
+
+static esp_err_t esp_vision_camera_dequeue_buffer(struct v4l2_buffer *buf)
+{
+    if (buf == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(buf, 0, sizeof(*buf));
+    buf->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf->memory = ESP_VISION_CAMERA_MEMORY_TYPE;
+
+    if (ioctl(s_camera.fd, VIDIOC_DQBUF, buf) != 0) {
+        return ESP_FAIL;
+    }
+
+    if ((buf->index >= ESP_VISION_CAMERA_BUFFER_COUNT) ||
+            (s_camera.buffers[buf->index].ptr == NULL) ||
+            (buf->flags & V4L2_BUF_FLAG_ERROR)) {
+        if (buf->index < ESP_VISION_CAMERA_BUFFER_COUNT) {
+            ioctl(s_camera.fd, VIDIOC_QBUF, buf);
+        }
+        return ESP_FAIL;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t esp_vision_camera_queue_buffer(struct v4l2_buffer *buf)
+{
+    if (buf == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return (ioctl(s_camera.fd, VIDIOC_QBUF, buf) == 0) ? ESP_OK : ESP_FAIL;
+}
+
+static void esp_vision_camera_cleanup(void)
+{
+    if (s_camera.streaming) {
+        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ioctl(s_camera.fd, VIDIOC_STREAMOFF, &type);
+        s_camera.streaming = false;
+    }
+
+    esp_vision_camera_release_buffers();
+    esp_vision_camera_release_ppa();
+
+    if (s_camera.fd >= 0) {
+        close(s_camera.fd);
+        s_camera.fd = -1;
+    }
+
+    esp_vision_camera_video_deinit();
+    s_camera.initialized = false;
+}
+
+esp_err_t esp_vision_camera_init(void)
+{
+    esp_err_t ret;
+
+    if (s_camera.initialized) {
+        return ESP_OK;
+    }
+
+    if ((s_camera.width == 0) || (s_camera.height == 0) || (s_camera.output_pixfmt == PIXFORMAT_INVALID)) {
+        esp_vision_camera_set_defaults();
+    }
+
+    ret = esp_vision_camera_video_init();
+    if (ret != ESP_OK) {
+        goto fail;
+    }
+
+    ret = esp_vision_camera_open_device();
+    if (ret != ESP_OK) {
+        goto fail;
+    }
+
+    ret = esp_vision_camera_set_input_format();
+    if (ret != ESP_OK) {
+        goto fail;
+    }
+
+    ret = esp_vision_camera_init_ppa();
+    if (ret != ESP_OK) {
+        goto fail;
+    }
+
+    ret = esp_vision_camera_init_buffers();
+    if (ret != ESP_OK) {
+        goto fail;
+    }
+
+    ret = esp_vision_camera_start_stream();
+    if (ret != ESP_OK) {
+        goto fail;
+    }
+
+    s_camera.initialized = true;
+    esp_vision_debug_printf("[esp-vision] camera started: sensor=0x%04" PRIx32
+                            " raw=%" PRIu32 "x%" PRIu32
+                            " active=%" PRIu32 "x%" PRIu32 "+%" PRIu32 "+%" PRIu32
+                            " output=%" PRIu32 "x%" PRIu32
+                            " pixfmt=%" PRIu32 "\r\n",
+                            ESP_VISION_CAMERA_SENSOR_ID,
+                            s_camera.raw_input_width,
+                            s_camera.raw_input_height,
+                            s_camera.active_input_width,
+                            s_camera.active_input_height,
+                            s_camera.active_input_offset_x,
+                            s_camera.active_input_offset_y,
+                            s_camera.width,
+                            s_camera.height,
+                            (uint32_t)s_camera.output_pixfmt);
+    return ESP_OK;
+
+fail:
+    esp_vision_camera_cleanup();
+    esp_vision_debug_printf("[esp-vision] camera start failed: %s\r\n", esp_err_to_name(ret));
+    return ret;
+}
+
+void esp_vision_camera_deinit(void)
+{
+    esp_vision_camera_cleanup();
+}
+
+bool esp_vision_camera_is_ready(void)
+{
+    return s_camera.initialized &&
+           s_camera.streaming &&
+           (s_camera.ppa_handle != NULL) &&
+           (s_camera.ppa_out_buf != NULL) &&
+           (s_camera.input_pixfmt == V4L2_PIX_FMT_RGB565) &&
+           (s_camera.width != 0) &&
+           (s_camera.height != 0);
+}
+
+esp_err_t esp_vision_camera_set_pixformat(uint32_t pixfmt)
+{
+    if ((pixfmt != PIXFORMAT_RGB565) && (pixfmt != PIXFORMAT_GRAYSCALE)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (s_camera.output_pixfmt == pixfmt) {
+        return ESP_OK;
+    }
+
+    s_camera.output_pixfmt = (pixformat_t)pixfmt;
+    if (s_camera.initialized) {
+        return esp_vision_camera_reinit_ppa();
+    }
+    return ESP_OK;
+}
+
+uint32_t esp_vision_camera_get_pixformat(void)
+{
+    return s_camera.output_pixfmt;
+}
+
+esp_err_t esp_vision_camera_set_framesize(esp_vision_camera_framesize_t framesize)
+{
+    uint32_t width = 0;
+    uint32_t height = 0;
+    esp_err_t ret = esp_vision_camera_get_framesize_dimensions(framesize, &width, &height);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if ((s_camera.width == width) && (s_camera.height == height)) {
+        return ESP_OK;
+    }
+
+    s_camera.width = width;
+    s_camera.height = height;
+    if (s_camera.initialized) {
+        return esp_vision_camera_reinit_ppa();
+    }
+    return ESP_OK;
+}
+
+uint32_t esp_vision_camera_get_width(void)
+{
+    return s_camera.width;
+}
+
+uint32_t esp_vision_camera_get_height(void)
+{
+    return s_camera.height;
+}
+
+esp_err_t esp_vision_camera_set_hmirror(bool enable)
+{
+    s_camera.hmirror = enable;
+    return ESP_OK;
+}
+
+bool esp_vision_camera_get_hmirror(void)
+{
+    return s_camera.hmirror;
+}
+
+esp_err_t esp_vision_camera_set_vflip(bool enable)
+{
+    s_camera.vflip = enable;
+    return ESP_OK;
+}
+
+bool esp_vision_camera_get_vflip(void)
+{
+    return s_camera.vflip;
+}
+
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL && CONFIG_ESP_VIDEO_ENABLE_ISP_PIPELINE_CONTROLLER
+esp_err_t esp_vision_camera_get_ipa(bool *enabled)
+{
+    return esp_vision_video_isp_get_controller(esp_vision_camera_is_ready(), s_camera.ipa_config, enabled);
+}
+
+esp_err_t esp_vision_camera_set_ipa(bool enable)
+{
+    bool enabled;
+    esp_err_t ret = esp_vision_camera_get_ipa(&enabled);
+    if ((ret != ESP_OK) || (enabled == enable)) {
+        return ret;
+    }
+
+    const esp_vision_camera_restart_ops_t ops = {
+        .release_buffers = esp_vision_camera_release_buffers,
+        .open_device = esp_vision_camera_open_device,
+        .set_input_format = esp_vision_camera_set_input_format,
+        .update_active_window = esp_vision_camera_update_active_window,
+        .init_buffers = esp_vision_camera_init_buffers,
+        .start_stream = esp_vision_camera_start_stream,
+        .cleanup = esp_vision_camera_cleanup,
+    };
+    return esp_vision_video_isp_set_controller(enable, &s_camera.fd, &s_camera.streaming, &s_camera.initialized,
+                                               s_camera.isp_device_path, s_camera.device_path, s_camera.ipa_config, &ops);
+}
+#endif
+
+#if ESP_VISION_ENABLE_CAMERA_IPA_CONTROL
+esp_err_t esp_vision_camera_get_isp(esp_vision_isp_block_t block, esp_vision_isp_config_t *config)
+{
+    if (!esp_vision_camera_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return esp_vision_video_isp_get(s_camera.fd, s_camera.isp_device_path, block, config);
+}
+
+esp_err_t esp_vision_camera_set_isp(esp_vision_isp_block_t block, const esp_vision_isp_config_t *config)
+{
+    if (!esp_vision_camera_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (esp_vision_video_isp_controller_active()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return esp_vision_video_isp_set(s_camera.fd, s_camera.isp_device_path, block, config);
+}
+#endif
+
+uint32_t esp_vision_camera_get_sensor_id(void)
+{
+    return ESP_VISION_CAMERA_SENSOR_ID;
+}
+
+size_t esp_vision_camera_frame_size(void)
+{
+    return esp_vision_camera_output_size(s_camera.width, s_camera.height, s_camera.output_pixfmt);
+}
+
+esp_err_t esp_vision_camera_capture(uint8_t *pixels, size_t pixels_size)
+{
+    struct v4l2_buffer buf;
+    bool dequeued = false;
+    esp_err_t ret;
+    size_t expected_size;
+
+    if ((pixels == NULL) || !esp_vision_camera_is_ready()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    expected_size = esp_vision_camera_frame_size();
+    if ((expected_size == 0) || (pixels_size < expected_size)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    ret = esp_vision_camera_dequeue_buffer(&buf);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    dequeued = true;
+
+    ppa_srm_oper_config_t ppa_config = {};
+    ppa_config.in.buffer = s_camera.buffers[buf.index].ptr;
+    ppa_config.in.pic_w = s_camera.raw_input_width;
+    ppa_config.in.pic_h = s_camera.raw_input_height;
+    ppa_config.in.block_w = s_camera.active_input_width;
+    ppa_config.in.block_h = s_camera.active_input_height;
+    ppa_config.in.block_offset_x = s_camera.active_input_offset_x;
+    ppa_config.in.block_offset_y = s_camera.active_input_offset_y;
+    ppa_config.in.srm_cm = PPA_SRM_COLOR_MODE_RGB565;
+    ppa_config.out.buffer = s_camera.ppa_out_buf;
+    ppa_config.out.buffer_size = s_camera.ppa_out_size;
+    ppa_config.out.pic_w = s_camera.width;
+    ppa_config.out.pic_h = s_camera.height;
+    ppa_config.out.block_offset_x = 0;
+    ppa_config.out.block_offset_y = 0;
+    ppa_config.out.srm_cm = esp_vision_camera_output_color_mode(s_camera.output_pixfmt);
+    ppa_config.rotation_angle = PPA_SRM_ROTATION_ANGLE_0;
+    ppa_config.scale_x = (float)s_camera.width / (float)s_camera.active_input_width;
+    ppa_config.scale_y = (float)s_camera.height / (float)s_camera.active_input_height;
+    ppa_config.mirror_x = s_camera.hmirror;
+    ppa_config.mirror_y = s_camera.vflip;
+    ppa_config.mode = PPA_TRANS_MODE_BLOCKING;
+
+    esp_cache_msync(s_camera.ppa_out_buf,
+                    s_camera.ppa_out_size,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_INVALIDATE);
+
+    ret = ppa_do_scale_rotate_mirror(s_camera.ppa_handle, &ppa_config);
+    if (ret != ESP_OK) {
+        goto exit;
+    }
+
+    esp_cache_msync(s_camera.ppa_out_buf, s_camera.ppa_out_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    memcpy(pixels, s_camera.ppa_out_buf, expected_size);
+
+exit:
+    if (dequeued) {
+        esp_err_t queue_ret = esp_vision_camera_queue_buffer(&buf);
+        if ((ret == ESP_OK) && (queue_ret != ESP_OK)) {
+            ret = queue_ret;
+        }
+    }
+    return ret;
+}
+
+esp_err_t esp_vision_camera_snapshot(image_t *img, uint8_t *pixels, size_t pixels_size)
+{
+    if (img == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t ret = esp_vision_camera_capture(pixels, pixels_size);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    img->w = s_camera.width;
+    img->h = s_camera.height;
+    img->pixfmt = s_camera.output_pixfmt;
+    img->size = 0;
+    img->_raw = NULL;
+    img->pixels = pixels;
+    return ESP_OK;
+}
+
+esp_err_t esp_vision_camera_get_status(esp_vision_camera_status_t *status)
+{
+    if (status == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    status->ready = esp_vision_camera_is_ready();
+    status->sensor_id = ESP_VISION_CAMERA_SENSOR_ID;
+    status->raw_input_width = s_camera.raw_input_width;
+    status->raw_input_height = s_camera.raw_input_height;
+    status->active_input_width = s_camera.active_input_width;
+    status->active_input_height = s_camera.active_input_height;
+    status->active_input_offset_x = s_camera.active_input_offset_x;
+    status->active_input_offset_y = s_camera.active_input_offset_y;
+    status->width = s_camera.width;
+    status->height = s_camera.height;
+    status->pixfmt = s_camera.output_pixfmt;
+    status->hmirror = s_camera.hmirror;
+    status->vflip = s_camera.vflip;
+    return ESP_OK;
+}

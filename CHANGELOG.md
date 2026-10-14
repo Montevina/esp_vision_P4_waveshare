@@ -8,6 +8,7 @@ All notable changes to ESP-VISION are recorded here. The format follows [Keep a 
 
 - Added runtime IPA and manual ISP control to the `sensor` module through `set_ipa()`, `get_ipa()`, `set_isp()`, and `get_isp()`, covering the exposure, pixel gain, demosaic, white balance, LSC, BLC, BF, sharpen, CCM, and gamma blocks over the ESP Video V4L2 controls. The feature is opt-in per board through `ESP_VISION_ENABLE_CAMERA_IPA_CONTROL` and is enabled on `ESP32_P4X_FUNCTION_EV_BOARD` and `ESP32_P4X_EYE`, with documentation in the `sensor` API reference and an example under `example/01-Camera/04-IPA`.
 - Added a hardware-in-the-loop CI stage that flashes the `ESP32_P4X_FUNCTION_EV_BOARD` build onto a real board and tests its camera and LCD, through `tools/ci/flash_and_test.py` and `tools/ci/device_checks.py`.
+- Added initial `ESP32_P4_WAVESHARE_DEV_KIT` support for the Waveshare ESP32-P4 Module Dev Kit: a free-running OV5647 MIPI-CSI camera on the shared SCCB bus (SDA 7, SCL 8; no reset, power-down, or XCLK wiring), hosted ESP32-C6 WiFi/BLE over 4-bit SDIO (CLK 18, CMD 19, D0-D3 14-17, reset 54), and 4-bit SDMMC storage on the on-chip LDO. The board has no LCD, so its default `main.py` flushes camera frames to the EV-MUX host preview instead.
 
 ### Fixed
 
